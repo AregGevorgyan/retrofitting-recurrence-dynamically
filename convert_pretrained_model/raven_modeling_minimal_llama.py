@@ -54,6 +54,7 @@ class CausalLMOutputRecurrentLatents(ModelOutput):
     hidden_states: Optional[torch.Tensor] = None
     attention_maps: Optional[dict[int, torch.Tensor]] = None
     stats: Optional[dict] = None
+    trajectory: Optional[list] = None
 
 
 ###################### Minimal implementation from here ############################################################
@@ -668,7 +669,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
 
         # Main recurrence
-        x, num_steps_no_grad, num_steps_with_grad, xk, block_idx = self.iterate_forward(
+        return_trajectory = output_details.get("return_trajectory", False)
+        x, num_steps_no_grad, num_steps_with_grad, xk, block_idx, trajectory = self.iterate_forward(
             input_embeds,  # type: ignore # mystery typing error
             input_states,
             freqs_cis,
@@ -677,6 +679,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             past_key_values,
             num_steps,
             init_scale,
+            return_trajectory=return_trajectory,
         )
         latent_states = x.clone().detach()
 
@@ -708,6 +711,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             stats=self.get_stats(logits, x, latent_states, xk, input_embeds, num_steps_no_grad, num_steps_with_grad)
             if output_details["return_stats"]
             else None,
+            trajectory=trajectory,
         )
 
     @torch._dynamo.disable(recursive=False)  # type: ignore
@@ -721,6 +725,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         past_key_values: Optional[ValidCache] = None,
         num_steps: Optional[torch.Tensor] = None,
         init_scale: float = 1.0,
+        return_trajectory: bool = False,
     ):
         x = xk = self.initialize_state(input_embeds, scale=init_scale) if input_states is None else input_states.clone()
         if num_steps is None:
@@ -729,6 +734,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             num_steps_no_grad, num_steps_with_grad = num_steps
         else:
             num_steps_no_grad, num_steps_with_grad = num_steps, torch.tensor(0) if not x.is_meta else 0
+
+        trajectory = [] if return_trajectory else None
 
         with torch.no_grad():
             # ultra annoying in ddp due to
@@ -740,13 +747,18 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 x, block_idx = self.core_block_forward(
                     xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, no_grad_step
                 )
+                if return_trajectory:
+                    trajectory.append(x.detach().clone())
 
         for grad_step in range(num_steps_with_grad):
             xk = x
             x, block_idx = self.core_block_forward(
                 xk, input_embeds, freqs_cis, mask, past_key_values, block_idx, num_steps_no_grad + grad_step
             )
-        return x, num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx  # type: ignore # types broken in 2.6+
+            if return_trajectory:
+                trajectory.append(x.detach().clone())
+
+        return x, num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx, trajectory  # type: ignore # types broken in 2.6+
 
     def core_block_forward(
         self,
